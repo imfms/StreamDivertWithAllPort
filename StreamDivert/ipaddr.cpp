@@ -60,7 +60,7 @@ IpAddr::~IpAddr()
 {
 }
 
-IPFamily IpAddr::get_family()
+IPFamily IpAddr::get_family() const
 {
 	if(memcmp(&this->m_addr.s6_addr[0], ipv4_mapped_prefix, sizeof(ipv4_mapped_prefix)) == 0)
 	{
@@ -104,7 +104,7 @@ in6_addr IpAddr::get_addr()
 	return this->m_addr;
 }
 
-in_addr IpAddr::get_ipv4_addr()
+in_addr IpAddr::get_ipv4_addr() const
 {
 	return *(in_addr*)&this->m_addr.s6_addr[12];
 }
@@ -146,4 +146,101 @@ bool IpAddr::operator>=(const IpAddr& addr2)
 bool IpAddr::operator>(const IpAddr& addr2)
 {
 	return ! ( *this <= addr2 );
+}
+
+bool IpAddr::isInSubnet(const IpAddr& networkAddr, int prefixLength) const
+{
+	if (this->get_family() != networkAddr.get_family())
+	{
+		return false;
+	}
+
+	if (this->get_family() == IPFamily::IPv4)
+	{
+		UINT32 thisAddr = ntohl(this->get_ipv4_addr().s_addr);
+		UINT32 netAddr = ntohl(networkAddr.get_ipv4_addr().s_addr);
+		
+		// Create subnet mask
+		UINT32 mask = 0xFFFFFFFF << (32 - prefixLength);
+		
+		// Check if both addresses are in the same subnet
+		return (thisAddr & mask) == (netAddr & mask);
+	}
+	else
+	{
+		// IPv6 subnet matching (simplified for /64 subnets)
+		// For full IPv6 support, would need more complex bit manipulation
+		if (prefixLength <= 64)
+		{
+			int bytesToCompare = prefixLength / 8;
+			int bitsInLastByte = prefixLength % 8;
+			
+			if (memcmp(&this->m_addr.s6_addr, &networkAddr.m_addr.s6_addr, bytesToCompare) != 0)
+			{
+				return false;
+			}
+			
+			if (bitsInLastByte > 0)
+			{
+				UINT8 mask = 0xFF << (8 - bitsInLastByte);
+				return (this->m_addr.s6_addr[bytesToCompare] & mask) == (networkAddr.m_addr.s6_addr[bytesToCompare] & mask);
+			}
+			return true;
+		}
+		return false;
+	}
+}
+
+bool IpAddr::isNetworkAddress() const
+{
+	if (this->get_family() == IPFamily::IPv4)
+	{
+		UINT32 addr = ntohl(this->get_ipv4_addr().s_addr);
+		// Check if it's a network address (any trailing zeros)
+		// 192.0.0.0 (/8), 192.168.0.0 (/16), 192.168.200.0 (/24)
+		return (addr & 0xFF) == 0;  // At least /24
+	}
+	else
+	{
+		// For IPv6, check if it ends with all zeros (simplified check)
+		for (int i = 8; i < 16; i++)
+		{
+			if (this->m_addr.s6_addr[i] != 0)
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+}
+
+int IpAddr::getNetworkPrefixLength() const
+{
+	if (this->get_family() == IPFamily::IPv4)
+	{
+		UINT32 addr = ntohl(this->get_ipv4_addr().s_addr);
+		
+		// Detect network class based on trailing zeros
+		if ((addr & 0xFFFFFF) == 0)  // xxx.0.0.0
+		{
+			return 8;  // Class A (/8)
+		}
+		else if ((addr & 0xFFFF) == 0)  // xxx.xxx.0.0
+		{
+			return 16; // Class B (/16) 
+		}
+		else if ((addr & 0xFF) == 0)  // xxx.xxx.xxx.0
+		{
+			return 24; // Class C (/24)
+		}
+		else
+		{
+			return 32; // Host address
+		}
+	}
+	else
+	{
+		// IPv6 simplified - assume /64 for network addresses
+		return 64;
+	}
 }

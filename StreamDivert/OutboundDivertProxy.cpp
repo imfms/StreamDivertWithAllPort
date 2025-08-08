@@ -50,16 +50,20 @@ std::string OutboundDivertProxy::generateDivertFilterString()
 			}
 		}
 	}
+	if (protocols.empty() || orExpressions.empty())
+	{
+		// No outbound rules configured, return a filter that matches nothing
+		return "false";
+	}
+	
 	result = "(";
 	joinStr(protocols, std::string(" or "), result);
 	result += ")";
 
-	if (orExpressions.size() > 0)
-	{
-		result += " and (";
-		joinStr(orExpressions, std::string(" or "), result);
-		result += ")";
-	}
+	result += " and (";
+	joinStr(orExpressions, std::string(" or "), result);
+	result += ")";
+	
 	return result;
 }
 

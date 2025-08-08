@@ -4,6 +4,9 @@
 #include <vector>
 #include <thread>
 #include <mutex>
+#include <map>
+#include <string>
+#include <chrono>
 #include "windivert.h"
 #include "BaseProxy.h"
 #include "config.h"
@@ -23,6 +26,14 @@ protected:
 	std::vector<InboundRelayEntry> proxyRecords;
 	SocksProxyServer socksServer;
 	bool containsSocksRecords;
+	
+	// For wildcard port support - map client address:port to original dest port
+	struct PortMappingEntry {
+		UINT16 originalPort;
+		std::chrono::steady_clock::time_point timestamp;
+	};
+	std::map<std::string, PortMappingEntry> clientToOriginalPortMap;
+	std::mutex portMapMutex;  // Thread safety for port mapping
 
 	std::string getStringDesc();
 	PacketAction ProcessTCPPacket(unsigned char* packet, UINT& packet_len, PWINDIVERT_ADDRESS addr, PWINDIVERT_IPHDR ip_hdr, PWINDIVERT_IPV6HDR ip6_hdr, PWINDIVERT_TCPHDR tcp_hdr, IpAddr& srcAddr, IpAddr& dstAddr);

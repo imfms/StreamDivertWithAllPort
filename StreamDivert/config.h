@@ -19,6 +19,8 @@ struct InboundRelayEntry
 	IpAddr srcAddr;
 	IpAddr forwardAddr;
 	UINT16 forwardPort;
+	bool wildcardPort;      // true if using * for port matching
+	bool passthroughPort;   // true if using * for forwarding port (keep original)
 };
 
 struct OutboundRelayEntry

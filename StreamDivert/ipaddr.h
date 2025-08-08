@@ -37,8 +37,11 @@ public:
 	bool operator<=(const IpAddr& addr2);
 	bool operator>=(const IpAddr& addr2);
 	bool operator>(const IpAddr& addr2);
-	IPFamily get_family();
+	IPFamily get_family() const;
 	std::string to_string();
 	in6_addr get_addr();
-	in_addr get_ipv4_addr();
+	in_addr get_ipv4_addr() const;
+	bool isInSubnet(const IpAddr& networkAddr, int prefixLength = 24) const;
+	bool isNetworkAddress() const;
+	int getNetworkPrefixLength() const;
 };

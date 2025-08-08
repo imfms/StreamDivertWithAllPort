@@ -125,6 +125,12 @@ std::string InboundUDPDivertProxy::generateDivertFilterString()
 		orExpressions.insert(recordFilterStr);
 	}
 
+	if (orExpressions.empty())
+	{
+		// No UDP rules configured, return a filter that matches nothing
+		return "false";
+	}
+	
 	result += " and (";
 	joinStr(orExpressions, std::string(" or "), result);
 	result += ")";

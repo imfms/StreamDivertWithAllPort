@@ -8,5 +8,6 @@ struct ProxyConnectionWorkerData
 {
 	SOCKET clientSock;
 	sockaddr_in6 clientAddr;
+	UINT16 originalDestPort;  // For wildcard port passthrough
 };
 

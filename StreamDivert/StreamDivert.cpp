@@ -92,14 +92,22 @@ int __cdecl main(int argc, char **argv)
 	info("Starting packet diverters...");
 	std::vector<BaseProxy*> proxies;
 	std::map<UINT16, std::vector<InboundRelayEntry>> mappedInboundTCPRelayEntries;
+	std::vector<InboundRelayEntry> wildcardTCPRelayEntries;  // For wildcard port entries
 	std::vector<InboundRelayEntry> inboundUDPRelayEntries;
 	std::vector<InboundRelayEntry> inboundICMPRelayEntries;
 	for (auto entry : cfg.inboundRelayEntries)
 	{
 		if (entry.protocol == "tcp")
 		{
-			std::vector<InboundRelayEntry>& entries = mappedInboundTCPRelayEntries[entry.localPort];
-			entries.push_back(entry);
+			if (entry.wildcardPort)
+			{
+				wildcardTCPRelayEntries.push_back(entry);
+			}
+			else
+			{
+				std::vector<InboundRelayEntry>& entries = mappedInboundTCPRelayEntries[entry.localPort];
+				entries.push_back(entry);
+			}
 		}
 		else if (entry.protocol == "udp")
 		{
@@ -117,6 +125,14 @@ int __cdecl main(int argc, char **argv)
 		proxy->Start();
 		proxies.push_back(proxy);
 		//proxy->Stop();
+	}
+	
+	// Create wildcard TCP proxy for entries with wildcardPort=true
+	if (!wildcardTCPRelayEntries.empty())
+	{
+		InboundTCPDivertProxy* wildcardProxy = new InboundTCPDivertProxy(verbose, 0, wildcardTCPRelayEntries);
+		wildcardProxy->Start();
+		proxies.push_back(wildcardProxy);
 	}
 	
 	InboundUDPDivertProxy* inboundUDPProxy = new InboundUDPDivertProxy(verbose, inboundUDPRelayEntries);

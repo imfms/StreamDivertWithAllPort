@@ -125,10 +125,41 @@ PacketAction InboundTCPDivertProxy::ProcessTCPPacket(unsigned char* packet, UINT
 	{
 		for (auto record = this->proxyRecords.begin(); record != this->proxyRecords.end(); ++record)
 		{
-			if ((srcAddr == record->srcAddr || record->srcAddr == anyIpAddr) &&
-				tcp_hdr->DstPort == htons(this->localPort))
+			// Skip processing if this is a connection TO or FROM the forward destination (prevents loops)
+			if (dstAddr == record->forwardAddr || srcAddr == record->forwardAddr)
+			{
+				this->logDebug("Skipping packet to/from forward destination: %s -> %s", srcAddr.to_string().c_str(), dstAddr.to_string().c_str());
+				continue;
+			}
+			
+			bool srcMatches = (srcAddr == record->srcAddr || record->srcAddr == anyIpAddr || 
+							   (record->srcAddr.isNetworkAddress() && srcAddr.isInSubnet(record->srcAddr, record->srcAddr.getNetworkPrefixLength())));
+			bool portMatches = false;
+			
+			if (record->wildcardPort)
+			{
+				// Wildcard port matches any port
+				portMatches = true;
+			}
+			else
+			{
+				// Specific port must match
+				portMatches = (tcp_hdr->DstPort == htons(this->localPort));
+			}
+			
+			if (srcMatches && portMatches)
 			{
 				std::string dstAddrStr = dstAddr.to_string();
+				
+				// For wildcard port, store the mapping of client to original dest port
+				if (record->wildcardPort)
+				{
+					std::string clientKey = srcAddr.to_string() + ":" + std::to_string(ntohs(tcp_hdr->SrcPort));
+					std::lock_guard<std::mutex> lock(this->portMapMutex);
+					PortMappingEntry entry = { ntohs(tcp_hdr->DstPort), std::chrono::steady_clock::now() };
+					this->clientToOriginalPortMap[clientKey] = entry;
+				}
+				
 				if (record->type == InboundRelayEntryType::Divert)
 				{
 					this->logDebug("Modify packet dst -> %s:%hu", dstAddrStr.c_str(), this->localProxyPort);
@@ -149,7 +180,16 @@ PacketAction InboundTCPDivertProxy::ProcessTCPPacket(unsigned char* packet, UINT
 	{
 		for (auto record = this->proxyRecords.begin(); record != this->proxyRecords.end(); ++record)
 		{
-			if ((dstAddr == record->srcAddr || record->srcAddr == anyIpAddr))
+			// Skip processing outbound connections TO or FROM the forward destination (prevents loops)
+			// This catches proxy's own connections to the target server
+			if (dstAddr == record->forwardAddr || srcAddr == record->forwardAddr)
+			{
+				this->logDebug("Skipping outbound packet to/from forward destination: %s -> %s", srcAddr.to_string().c_str(), dstAddr.to_string().c_str());
+				continue;
+			}
+			
+			if ((dstAddr == record->srcAddr || record->srcAddr == anyIpAddr || 
+				 (record->srcAddr.isNetworkAddress() && dstAddr.isInSubnet(record->srcAddr, record->srcAddr.getNetworkPrefixLength()))))
 			{
 				if (
 					(record->type == InboundRelayEntryType::Divert && tcp_hdr->SrcPort == htons(this->localProxyPort) ) ||
@@ -157,8 +197,48 @@ PacketAction InboundTCPDivertProxy::ProcessTCPPacket(unsigned char* packet, UINT
 					)
 				{
 					std::string srcAddrStr = srcAddr.to_string();
-					this->logDebug("Modify packet src -> %s:%hu", srcAddrStr.c_str(), this->localPort);
-					tcp_hdr->SrcPort = htons(this->localPort);
+					if (record->wildcardPort)
+					{
+						// For wildcard port, we need to get the original dest port from the connection mapping
+						// Note: In outbound packets, dstAddr is the original client, tcp_hdr->DstPort is the original client port
+						std::string clientKey = dstAddr.to_string() + ":" + std::to_string(ntohs(tcp_hdr->DstPort));
+						std::lock_guard<std::mutex> lock(this->portMapMutex);
+						auto it = this->clientToOriginalPortMap.find(clientKey);
+						if (it != this->clientToOriginalPortMap.end())
+						{
+							UINT16 originalPort = it->second.originalPort;
+							this->logDebug("Modify packet src -> %s:%hu (restored from wildcard)", srcAddrStr.c_str(), originalPort);
+							tcp_hdr->SrcPort = htons(originalPort);
+						}
+						else
+						{
+							// Fallback: try to find any mapping for this client IP
+							std::string clientIP = dstAddr.to_string();
+							UINT16 foundPort = 0;
+							for (auto& mapping : this->clientToOriginalPortMap)
+							{
+								if (mapping.first.find(clientIP + ":") == 0)
+								{
+									foundPort = mapping.second.originalPort;
+									break;
+								}
+							}
+							if (foundPort > 0)
+							{
+								this->logDebug("Modify packet src -> %s:%hu (restored from wildcard fallback)", srcAddrStr.c_str(), foundPort);
+								tcp_hdr->SrcPort = htons(foundPort);
+							}
+							else
+							{
+								this->logDebug("Modify packet src -> %s (wildcard port - no mapping found)", srcAddrStr.c_str());
+							}
+						}
+					}
+					else
+					{
+						this->logDebug("Modify packet src -> %s:%hu", srcAddrStr.c_str(), this->localPort);
+						tcp_hdr->SrcPort = htons(this->localPort);
+					}
 					break;
 				}				
 			}
@@ -190,8 +270,32 @@ void InboundTCPDivertProxy::ProxyWorker()
 		ProxyConnectionWorkerData* proxyConnectionWorkerData = new ProxyConnectionWorkerData();
 		proxyConnectionWorkerData->clientSock = incommingSock;
 		proxyConnectionWorkerData->clientAddr = clientSockAddr;
-		std::thread proxyConnectionThread(&InboundTCPDivertProxy::ProxyConnectionWorker, this, proxyConnectionWorkerData);
-		proxyConnectionThread.detach();
+		
+		// Look up original destination port for wildcard entries
+		std::string clientKey = clientSockIp.to_string() + ":" + std::to_string(ntohs(clientSockAddr.sin6_port));
+		{
+			std::lock_guard<std::mutex> lock(this->portMapMutex);
+			auto it = this->clientToOriginalPortMap.find(clientKey);
+			if (it != this->clientToOriginalPortMap.end())
+			{
+				proxyConnectionWorkerData->originalDestPort = it->second.originalPort;
+				// 注意：不要在这里删除映射，等连接结束后再清理
+				// this->clientToOriginalPortMap.erase(it); // 移除这行
+			}
+			else
+			{
+				proxyConnectionWorkerData->originalDestPort = this->localPort; // Default to configured port
+			}
+		}
+		try {
+			std::thread proxyConnectionThread(&InboundTCPDivertProxy::ProxyConnectionWorker, this, proxyConnectionWorkerData);
+			proxyConnectionThread.detach();
+		}
+		catch (...) {
+			this->logError("Failed to create proxy connection thread");
+			delete proxyConnectionWorkerData;
+			closesocket(incommingSock);
+		}
 	}
 cleanup:
 	if (this->proxySock != NULL)
@@ -206,10 +310,19 @@ void InboundTCPDivertProxy::ProxyConnectionWorker(ProxyConnectionWorkerData* pro
 {
 	int off = 0;
 	SOCKET destSock = NULL;
+	
+	// 防御性编程 - 检查空指针
+	if (!proxyConnectionWorkerData) {
+		this->logError("ProxyConnectionWorkerData is null");
+		return;
+	}
+	
 	SOCKET clientSock = proxyConnectionWorkerData->clientSock;
 	sockaddr_in6 clientSockAddr = proxyConnectionWorkerData->clientAddr;
 	IpAddr clientSockIp = IpAddr(clientSockAddr.sin6_addr);
+	UINT16 originalDestPort = proxyConnectionWorkerData->originalDestPort;
 	delete proxyConnectionWorkerData;
+	proxyConnectionWorkerData = nullptr;  // 防止重复使用
 
 	std::string selfDesc = this->getStringDesc();
 
@@ -223,7 +336,10 @@ void InboundTCPDivertProxy::ProxyConnectionWorker(ProxyConnectionWorkerData* pro
 		ZeroMemory(&destAddr, sizeof(destAddr));
 		destAddr.sin6_family = AF_INET6;
 		destAddr.sin6_addr = proxyRecord.forwardAddr.get_addr();
-		destAddr.sin6_port = htons(proxyRecord.forwardPort);
+		
+		// Use original port if passthrough is enabled, otherwise use configured forward port
+		UINT16 destPort = proxyRecord.passthroughPort ? originalDestPort : proxyRecord.forwardPort;
+		destAddr.sin6_port = htons(destPort);
 		destSock = socket(AF_INET6, SOCK_STREAM, 0);
 		if (destSock == INVALID_SOCKET)
 		{
@@ -236,14 +352,14 @@ void InboundTCPDivertProxy::ProxyConnectionWorker(ProxyConnectionWorkerData* pro
 			goto cleanup;
 		}
 		std::string forwardAddr = proxyRecord.forwardAddr.to_string();
-		this->logInfo("Connecting to forward host %s:%hu", forwardAddr.c_str(), proxyRecord.forwardPort);
+		this->logInfo("Connecting to forward host %s:%hu", forwardAddr.c_str(), destPort);
 		if (connect(destSock, (SOCKADDR *)&destAddr, sizeof(destAddr)) == SOCKET_ERROR)
 		{
 			this->logError("failed to connect socket (%d)", WSAGetLastError());
 			goto cleanup;
 		}
 
-		this->logInfo("Starting to route %s:%hu -> %s:%hu", srcAddr.c_str(), clientSrcPort, forwardAddr.c_str(), proxyRecord.forwardPort);
+		this->logInfo("Starting to route %s:%hu -> %s:%hu", srcAddr.c_str(), clientSrcPort, forwardAddr.c_str(), destPort);
 		ProxyTunnelWorkerData* tunnelDataA = new ProxyTunnelWorkerData();
 		ProxyTunnelWorkerData* tunnelDataB = new ProxyTunnelWorkerData();
 		tunnelDataA->sockA = clientSock;
@@ -270,6 +386,18 @@ cleanup:
 	if (destSock != NULL)
 		closesocket(destSock);
 
+	// 清理端口映射
+	std::string clientKey = srcAddr + ":" + std::to_string(clientSrcPort);
+	{
+		std::lock_guard<std::mutex> lock(this->portMapMutex);
+		auto it = this->clientToOriginalPortMap.find(clientKey);
+		if (it != this->clientToOriginalPortMap.end())
+		{
+			this->logDebug("Cleaning up port mapping for %s", clientKey.c_str());
+			this->clientToOriginalPortMap.erase(it);
+		}
+	}
+
 	this->logInfo("ProxyConnectionWorker exiting for client %s:%hu", srcAddr.c_str(), clientSrcPort);
 	return;
 }
@@ -287,14 +415,52 @@ std::string InboundTCPDivertProxy::generateDivertFilterString()
 		orExpressions.push_back(proxyFilterStr);
 	}
 
-	//check for wildcard address
-	bool containsWildcard = false;	
+	//check for wildcard address and wildcard port
+	bool containsWildcard = false;
+	bool containsWildcardPort = false;
 	for (auto record = this->proxyRecords.begin(); record != this->proxyRecords.end(); ++record)
 	{
+		if (record->wildcardPort)
+		{
+			containsWildcardPort = true;
+		}
 		if (record->srcAddr == anyIpAddr)
 		{
-			std::string recordFilterStr = "(tcp.DstPort == " + std::to_string(this->localPort) + ")";
-			orExpressions.push_back(recordFilterStr);
+			if (record->wildcardPort)
+			{
+				// For wildcard port with wildcard source, only capture inbound traffic
+				// This prevents capturing the proxy's own outbound connections
+				std::string recordFilterStr = "(inbound and tcp)";
+				orExpressions.push_back(recordFilterStr);
+			}
+			else
+			{
+				// For specific port with wildcard address
+				std::string recordFilterStr = "(tcp.DstPort == " + std::to_string(this->localPort) + ")";
+				orExpressions.push_back(recordFilterStr);
+			}
+			containsWildcard = true;
+			break;
+		}
+		else if (record->srcAddr.isNetworkAddress())
+		{
+			// Network address - create filter for the entire subnet with dynamic prefix
+			std::string srcAddrIpStr = this->getIpAddrIpStr(record->srcAddr);
+			int prefixLength = record->srcAddr.getNetworkPrefixLength();
+			
+			if (record->wildcardPort)
+			{
+				// For wildcard port with network address, exclude connections TO forward destinations
+				// Use simplified filter for now - just capture all TCP, handle exclusion in code
+				std::string recordFilterStr = "tcp";
+				orExpressions.push_back(recordFilterStr);
+			}
+			else
+			{
+				// For specific port with network address, fall back to port-only for now
+				std::string recordFilterStr = "(tcp.DstPort == " + std::to_string(this->localPort) + ")";
+				orExpressions.push_back(recordFilterStr);
+			}
 			containsWildcard = true;
 			break;
 		}
@@ -306,8 +472,18 @@ std::string InboundTCPDivertProxy::generateDivertFilterString()
 		{
 			std::string srcAddrIpStr = this->getIpAddrIpStr(record->srcAddr);
 
-			std::string recordFilterStr = "(tcp.DstPort == " + std::to_string(this->localPort) + " and " + srcAddrIpStr + ".SrcAddr == " + record->srcAddr.to_string() + ")";
-			orExpressions.push_back(recordFilterStr);
+			if (record->wildcardPort)
+			{
+				// For wildcard port with specific source address
+				std::string recordFilterStr = "(" + srcAddrIpStr + ".SrcAddr == " + record->srcAddr.to_string() + ")";
+				orExpressions.push_back(recordFilterStr);
+			}
+			else
+			{
+				// For specific port with specific source address
+				std::string recordFilterStr = "(tcp.DstPort == " + std::to_string(this->localPort) + " and " + srcAddrIpStr + ".SrcAddr == " + record->srcAddr.to_string() + ")";
+				orExpressions.push_back(recordFilterStr);
+			}
 		}
 	}
 
@@ -321,10 +497,27 @@ bool InboundTCPDivertProxy::findProxyRecordBySrcAddr(IpAddr& srcAddr, InboundRel
 {
 	for (auto record = this->proxyRecords.begin(); record != this->proxyRecords.end(); ++record)
 	{
-		if (record->srcAddr == anyIpAddr || record->srcAddr == srcAddr)
+		if (record->srcAddr == anyIpAddr)
 		{
+			// Wildcard match (0.0.0.0)
 			proxyRecord = *record;
 			return true;
+		}
+		else if (record->srcAddr == srcAddr)
+		{
+			// Exact IP match
+			proxyRecord = *record;
+			return true;
+		}
+		else if (record->srcAddr.isNetworkAddress())
+		{
+			// Subnet match - check if srcAddr is in the network defined by record->srcAddr
+			int prefixLength = record->srcAddr.getNetworkPrefixLength();
+			if (srcAddr.isInSubnet(record->srcAddr, prefixLength))
+			{
+				proxyRecord = *record;
+				return true;
+			}
 		}
 	}
 	return false;
